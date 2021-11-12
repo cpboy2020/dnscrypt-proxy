@@ -10,13 +10,12 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/facebookgo/pidfile"
 	"github.com/jedisct1/dlog"
 	"github.com/kardianos/service"
 )
 
 const (
-	AppVersion            = "2.0.44"
+	AppVersion            = "2.1.1"
 	DefaultConfigFileName = "dnscrypt-proxy.toml"
 )
 
@@ -30,6 +29,7 @@ type App struct {
 func main() {
 	TimezoneSetup()
 	dlog.Init("dnscrypt-proxy", dlog.SeverityNotice, "DAEMON")
+	runtime.MemProfileRate = 0
 
 	seed := make([]byte, 8)
 	crypto_rand.Read(seed)
@@ -42,8 +42,8 @@ func main() {
 
 	svcFlag := flag.String("service", "", fmt.Sprintf("Control the system service: %q", service.ControlAction))
 	version := flag.Bool("version", false, "print current proxy version")
-	resolve := flag.String("resolve", "", "resolve a name using system libraries")
 	flags := ConfigFlags{}
+	flags.Resolve = flag.String("resolve", "", "resolve a DNS name (string can be <name> or <name>,<resolver address>)")
 	flags.List = flag.Bool("list", false, "print the list of available resolvers for the enabled filters")
 	flags.ListAll = flag.Bool("list-all", false, "print the complete list of available resolvers, ignoring filters")
 	flags.JSONOutput = flag.Bool("json", false, "output list as JSON")
@@ -57,10 +57,6 @@ func main() {
 
 	if *version {
 		fmt.Println(AppVersion)
-		os.Exit(0)
-	}
-	if resolve != nil && len(*resolve) > 0 {
-		Resolve(*resolve)
 		os.Exit(0)
 	}
 
@@ -127,12 +123,14 @@ func (app *App) AppMain() {
 	if err := ConfigLoad(app.proxy, app.flags); err != nil {
 		dlog.Fatal(err)
 	}
+	if err := PidFileCreate(); err != nil {
+		dlog.Criticalf("Unable to create the PID file: %v", err)
+	}
 	if err := app.proxy.InitPluginsGlobals(); err != nil {
 		dlog.Fatal(err)
 	}
 	app.quit = make(chan struct{})
 	app.wg.Add(1)
-	_ = pidfile.Write()
 	app.proxy.StartProxy()
 	runtime.GC()
 	<-app.quit
@@ -141,9 +139,7 @@ func (app *App) AppMain() {
 }
 
 func (app *App) Stop(service service.Service) error {
-	if pidFilePath := pidfile.GetPidfilePath(); len(pidFilePath) > 1 {
-		os.Remove(pidFilePath)
-	}
+	PidFileRemove()
 	dlog.Notice("Stopped.")
 	return nil
 }

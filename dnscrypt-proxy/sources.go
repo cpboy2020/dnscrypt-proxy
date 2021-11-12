@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/dchest/safefile"
 
@@ -39,6 +38,7 @@ type Source struct {
 	cacheFile               string
 	cacheTTL, prefetchDelay time.Duration
 	refresh                 time.Time
+	prefix                  string
 }
 
 func (source *Source) checkSignature(bin, sig []byte) (err error) {
@@ -131,7 +131,7 @@ func (source *Source) parseURLs(urls []string) {
 }
 
 func fetchFromURL(xTransport *XTransport, u *url.URL) (bin []byte, err error) {
-	bin, _, _, err = xTransport.Get(u, "", DefaultTimeout)
+	bin, _, _, _, err = xTransport.Get(u, "", DefaultTimeout)
 	return bin, err
 }
 
@@ -180,11 +180,11 @@ func (source *Source) fetchWithCache(xTransport *XTransport, now time.Time) (del
 }
 
 // NewSource loads a new source using the given cacheFile and urls, ensuring it has a valid signature
-func NewSource(name string, xTransport *XTransport, urls []string, minisignKeyStr string, cacheFile string, formatStr string, refreshDelay time.Duration) (source *Source, err error) {
+func NewSource(name string, xTransport *XTransport, urls []string, minisignKeyStr string, cacheFile string, formatStr string, refreshDelay time.Duration, prefix string) (source *Source, err error) {
 	if refreshDelay < DefaultPrefetchDelay {
 		refreshDelay = DefaultPrefetchDelay
 	}
-	source = &Source{name: name, urls: []*url.URL{}, cacheFile: cacheFile, cacheTTL: refreshDelay, prefetchDelay: DefaultPrefetchDelay}
+	source = &Source{name: name, urls: []*url.URL{}, cacheFile: cacheFile, cacheTTL: refreshDelay, prefetchDelay: DefaultPrefetchDelay, prefix: prefix}
 	if formatStr == "v2" {
 		source.format = SourceFormatV2
 	} else {
@@ -223,15 +223,15 @@ func PrefetchSources(xTransport *XTransport, sources []*Source) time.Duration {
 	return interval
 }
 
-func (source *Source) Parse(prefix string) ([]RegisteredServer, error) {
+func (source *Source) Parse() ([]RegisteredServer, error) {
 	if source.format == SourceFormatV2 {
-		return source.parseV2(prefix)
+		return source.parseV2()
 	}
 	dlog.Fatal("Unexpected source format")
 	return []RegisteredServer{}, nil
 }
 
-func (source *Source) parseV2(prefix string) ([]RegisteredServer, error) {
+func (source *Source) parseV2() ([]RegisteredServer, error) {
 	var registeredServers []RegisteredServer
 	var stampErrs []string
 	appendStampErr := func(format string, a ...interface{}) {
@@ -246,21 +246,21 @@ func (source *Source) parseV2(prefix string) ([]RegisteredServer, error) {
 	}
 	parts = parts[1:]
 	for _, part := range parts {
-		part = strings.TrimFunc(part, unicode.IsSpace)
+		part = strings.TrimSpace(part)
 		subparts := strings.Split(part, "\n")
 		if len(subparts) < 2 {
 			return registeredServers, fmt.Errorf("Invalid format for source at [%v]", source.urls)
 		}
-		name := strings.TrimFunc(subparts[0], unicode.IsSpace)
+		name := strings.TrimSpace(subparts[0])
 		if len(name) == 0 {
 			return registeredServers, fmt.Errorf("Invalid format for source at [%v]", source.urls)
 		}
 		subparts = subparts[1:]
-		name = prefix + name
+		name = source.prefix + name
 		var stampStr, description string
 		stampStrs := make([]string, 0)
 		for _, subpart := range subparts {
-			subpart = strings.TrimFunc(subpart, unicode.IsSpace)
+			subpart = strings.TrimSpace(subpart)
 			if strings.HasPrefix(subpart, "sdns:") && len(subpart) >= 6 {
 				stampStrs = append(stampStrs, subpart)
 				continue

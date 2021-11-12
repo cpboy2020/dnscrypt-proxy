@@ -9,10 +9,11 @@
 
 ## Overview
 
-A flexible DNS proxy, with support for modern encrypted DNS protocols such as [DNSCrypt v2](https://dnscrypt.info/protocol), [DNS-over-HTTPS](https://www.rfc-editor.org/rfc/rfc8484.txt) and [Anonymized DNSCrypt](https://github.com/DNSCrypt/dnscrypt-protocol/blob/master/ANONYMIZED-DNSCRYPT.txt).
+A flexible DNS proxy, with support for modern encrypted DNS protocols such as [DNSCrypt v2](https://dnscrypt.info/protocol), [DNS-over-HTTPS](https://www.rfc-editor.org/rfc/rfc8484.txt), [Anonymized DNSCrypt](https://github.com/DNSCrypt/dnscrypt-protocol/blob/master/ANONYMIZED-DNSCRYPT.txt) and [ODoH (Oblivious DoH)](https://github.com/DNSCrypt/dnscrypt-resolvers/blob/master/v3/odoh.md).
 
 * **[dnscrypt-proxy documentation](https://dnscrypt.info/doc) ← Start here**
 * [DNSCrypt project home page](https://dnscrypt.info/)
+* [Discussions](https://github.com/DNSCrypt/dnscrypt-proxy/discussions)
 * [DNS-over-HTTPS and DNSCrypt resolvers](https://dnscrypt.info/public-servers)
 * [Server and client implementations](https://dnscrypt.info/implementations)
 * [DNS stamps](https://dnscrypt.info/stamps)
@@ -24,7 +25,7 @@ Available as source code and pre-built binaries for most operating systems and a
 
 ## Features
 
-* DNS traffic encryption and authentication. Supports DNS-over-HTTPS (DoH) using TLS 1.3, DNSCrypt and Anonymized DNS
+* DNS traffic encryption and authentication. Supports DNS-over-HTTPS (DoH) using TLS 1.3, DNSCrypt, Anonymized DNS and ODoH
 * Client IP addresses can be hidden using Tor, SOCKS proxies or Anonymized DNS relays
 * DNS query monitoring, with separate log files for regular and suspicious queries
 * Filtering: block ads, malware, and other unwanted content. Compatible with all DNS services
@@ -37,7 +38,7 @@ Available as source code and pre-built binaries for most operating systems and a
 * Automatic background updates of resolvers lists
 * Can force outgoing connections to use TCP
 * Compatible with DNSSEC
-* Includes a local DoH server in order to support ECHO (ESNI)
+* Includes a local DoH server in order to support ECH (ESNI)
 
 ## Pre-built binaries
 

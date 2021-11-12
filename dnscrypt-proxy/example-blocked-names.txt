@@ -1,6 +1,6 @@
 
 ###########################
-#        Blacklist        #
+#        Blocklist        #
 ###########################
 
 ## Rules for name-based query blocking, one per line
@@ -30,6 +30,13 @@ tracker.*
 eth0.me
 *.workgroup
 
+
+## Prevent usage of Apple private relay, that bypasses DNS
+
+# mask.apple-dns.net
+# mask.icloud.com
+# mask-api.icloud.com
+# doh.dns.apple.com
 
 
 ## Time-based rules
