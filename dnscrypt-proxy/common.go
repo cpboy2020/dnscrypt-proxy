@@ -47,6 +47,11 @@ const (
 	InheritedDescriptorsBase = uintptr(50)
 )
 
+const (
+	IPv4Arpa = "in-addr.arpa"
+	IPv6Arpa = "ip6.arpa"
+)
+
 func PrefixWithSize(packet []byte) ([]byte, error) {
 	packetLen := len(packet)
 	if packetLen > 0xffff {
@@ -90,20 +95,6 @@ func Min(a, b int) int {
 }
 
 func Max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func MinF(a, b float64) float64 {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func MaxF(a, b float64) float64 {
 	if a > b {
 		return a
 	}
