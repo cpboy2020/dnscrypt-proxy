@@ -1,3 +1,182 @@
+# Version 2.1.15
+ - The proxy now dynamically reduces timeouts as the connection limit is
+approached, improving performance and preventing connection exhaustion under
+heavy load.
+ - Fixed crashes in the configuration file watcher when fsnotify creation
+fails.
+ - DHCP resolver errors ($DHCP forwarding) are now properly logged and
+visible to system administrators.
+ - Fixed double-bracketing of IPv6 addresses in DoH stamps that could prevent
+proper connection to IPv6 DoH servers.
+ - Cache statistics are now more accurate by only counting queries that
+actually participate in caching.
+ - The monitoring UI has been enhanced with server health indicators and
+improved display of resolver performance metrics.
+ - Proxy hostnames (when using SOCKS/HTTP proxies) are now pre-resolved using
+bootstrap resolvers if they are domain names.
+ - Multiple IP addresses per hostname are now cached instead of randomly
+selecting one, improving connection reliability for multi-homed servers.
+
+# Version 2.1.14
+ - Added support for client IP address encryption in logs using IPCrypt
+(https://ipcrypt-std.github.io/). Three algorithms are supported:
+deterministic, non-deterministic with 8-byte tweak, and extended
+non-deterministic with 16-byte tweak.
+ - Enhanced pattern rule documentation with better examples.
+ - Fixed an issue where nil client addresses could cause crashes.
+
+# Version 2.1.13
+ - Fixed race conditions in WebSocket handling for the monitoring dashboard,
+improving stability and preventing potential crashes.
+ - Manual configuration reload via SIGHUP is now supported regardless of the
+hot-reload setting, providing more flexibility for system administrators.
+ - Fixed a regression in IP prefix matching for allow/block lists that could
+cause incorrect filtering behavior.
+ - The monitoring dashboard now properly displays blocked queries counter and
+tracks blocked queries in the UI.
+ - Improved error handling in the cache plugin initialization.
+ - Enhanced the forward plugin to return the last valid response when
+encountering only errors, improving resilience.
+ - Fixed various UI issues including scrolling behavior, WebSocket reconnection
+handling, and response time calculations.
+ - Updated the example configuration with current Quad9 source URLs.
+ - The generate-domains-blocklist script now handles poor network conditions
+more gracefully.
+ - Improved handling of DNS64 trampoline queries to prevent potential issues.
+
+# Version 2.1.12
+ - A new Weighted Power of Two (WP2) load balancing strategy has been
+implemented as the default, providing improved distribution across resolvers.
+ - An optional Prometheus metrics endpoint has been added for monitoring and
+observability.
+ - Memory usage for the cache has been reduced.
+ - The monitoring dashboard has received significant improvements including
+better security, performance optimizations, WebSocket rate limiting, and HTTP
+caching headers.
+ - The monitoring UI has been refined with stable sorting to prevent
+flickering, query type limitations, and improved scrolling behavior.
+ - Additional records in queries are now properly removed before forwarding.
+ - The simple view UI has been removed as it provided limited utility.
+
+# Version 2.1.11
+ - The sievecache dependency was updated to fix a bug causing the cache to crash.
+
+# Version 2.1.10
+ - Hot-reloading of configuration files is now optional and disabled by default.
+It can be enabled by setting `enable_hot_reload = true` in the configuration file.
+ - The file system monitoring for hot-reloading now uses efficient OS-native 
+file notifications instead of polling, reducing CPU usage and improving responsiveness.
+
+# Version 2.1.9
+ - A live web-based monitoring UI has been added, allowing you to monitor DNS
+query activity and performance metrics through an interactive dashboard.
+ - Hot-reloading of configuration files has been implemented, allowing you to
+modify filtering rules and other configurations without restarting the proxy.
+Simply edit a configuration file (like blocked-names.txt) and changes are
+applied instantaneously.
+ - HTTP/3 probing is now supported via the `http3_probe` option, which will
+try HTTP/3 first for DoH servers, even if they don't advertise support via
+Alt-Svc.
+ - Authentication for the monitoring UI can be disabled by setting the
+username to an empty string in the configuration.
+ - Several race conditions have been fixed.
+ - Dependencies have been updated.
+ - DHCP DNS detector instances have been reduced to improve performance.
+ - Tor isolation for dnscrypt-proxy has been documented to enhance privacy.
+ - The default example configuration file has been improved for clarity and
+usability.
+ - The cache lock contention has been reduced to improve performance under
+high load.
+ - generate-domains-blocklist: added parallel downloading of block lists for
+significantly improved performance.
+
+# Version 2.1.8
+ - Dependencies have been updated, notably the QUIC implementation,
+which could be vulnerable to denial-of-service attacks.
+ - In forwarding rules, the target can now optionally include a
+non-standard DNS port number. The port number is also now optional when
+using IPv6.
+ - An annoying log message related to permissions on Windows has been
+suppressed.
+ - Resolver IP addresses can now be refreshed more frequently.
+Additionally, jitter has been introduced to prevent all resolvers from
+being refreshed simultaneously. Further changes have been implemented
+to mitigate issues arising from multiple concurrent attempts to resolve
+a resolver's IP address.
+ - An empty value for "tls_cipher_suite" is now equivalent to leaving
+the property undefined. Previously, it disabled all TLS cipher suites,
+which had little practical justification.
+ - In forwarding rules, an optional `*.` prefix is now accepted.
+
+# Version 2.1.7
+ - This version reintroduces support for XSalsa20 enryption in DNSCrypt,
+which was removed in 2.1.6. Unfortunately, a bunch of servers still
+only support that encryption system.
+ - A check for lying resolvers was added for DNSCrypt, similar to the one
+that was already present for DoH and ODoH.
+ - Binary packages for Windows/ARM are now available, albeit not in MSI
+format yet.
+
+# Version 2.1.6
+ - Forwarding: in the list of servers for a zone, the `$BOOTSTRAP` keyword
+ can be included as a shortcut to forward to the bootstrap servers.
+ And the `$DHCP` keyword can be included to forward to the DNS resolvers
+ provided by the local DHCP server. Based on work by YX Hao, thanks!
+ DHCP forwarding should be considered experimental and may not work on all
+ operating systems. A rule for a zone can mix and match multiple forwarder
+ types, such as `10.0.0.1,10.0.0.254,$DHCP,192.168.1.1,$BOOTSTRAP`.
+ Note that this is not implemented for captive portals yet.
+ - Lying resolvers are now skipped, instead of just printing an error.
+ This doesn't apply to captive portal and forwarding entries, which are the
+ only reasonable use case for lying resolvers.
+ - Support for XSalsa20 in DNSCrypt has been removed. This was not documented,
+ and was supserseded by XChaCha20 in 2016.
+ - Source files are now fetched with compression.
+ - DNS64: compatibility has been improved.
+ - Forwarding: the root domain (`.`) can now be forwarded.
+ - The ARC caching algorithm has been replaced by the SIEVE algorithm.
+ - Properties of multiple servers are now updated simultaneously.
+ The concurrency level can be adjusted with the new `cert_refresh_concurrency`
+ setting. Contributed by YX Hao.
+ - MSI packages for DNSCrypt can now easily be built.
+ - New command-line flag: `-include-relays` to include relays in `-list` and
+ `-list-all`.
+ - Support for DNS extended error codes has been added.
+ - Documentation updates, bug fixes, dependency updates.
+
+# Version 2.1.5
+ - dnscrypt-proxy can be compiled with Go 1.21.0+
+ - Responses to blocked queries now include extended error codes
+ - Reliability of connections using HTTP/3 has been improved
+ - New configuration directive: `tls_key_log_file`. When defined, this
+is the path to a file where TLS secret keys will be written to, so
+that DoH traffic can be locally inspected.
+
+# Version 2.1.4
+ - Fixes a regression from version 2.1.3: when cloaking was enabled,
+blocked responses were returned for records that were not A/AAAA/PTR
+even for names that were not in the cloaked list.
+
+# Version 2.1.3
+ - DNS-over-HTTP/3 (QUIC) should be more reliable. In particular,
+version 2.1.2 required another (non-QUIC) resolver to be present for
+bootstrapping, or the resolver's IP address to be present in the
+stamp. This is not the case any more.
+ - dnscrypt-proxy is now compatible with Go 1.20+
+ - Commands (-check, -show-certs, -list, -list-all) now ignore log
+files and directly output the result to the standard output.
+ - The `cert_ignore_timestamp` configuration switch is now documented.
+It allows ignoring timestamps for DNSCrypt certificate verification,
+until a first server is available. This should only be used on devices
+that don't have any ways to set the clock before DNS service is up.
+However, a safer alternative remains to use an NTP server with a fixed
+IP address (such as time.google.com), configured in the captive portals
+file.
+ - Cloaking: when a name is cloaked, unsupported record types now
+return a blocked response rather than the actual records.
+ - systemd: report Ready earlier as dnscrypt-proxy can itself manage
+retries for updates/refreshes.
+
 # Version 2.1.2
  - Support for DoH over HTTP/3 (DoH3, HTTP over QUIC) has been added.
 Compatible servers will automatically use it. Note that QUIC uses UDP

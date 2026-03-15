@@ -4,16 +4,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"time"
 
+	"codeberg.org/miekg/dns"
 	"github.com/jedisct1/dlog"
-	"github.com/miekg/dns"
 )
 
 type PluginNxLog struct {
-	logger io.Writer
-	format string
+	logger        io.Writer
+	format        string
+	ipCryptConfig *IPCryptConfig
 }
 
 func (plugin *PluginNxLog) Name() string {
@@ -27,6 +27,7 @@ func (plugin *PluginNxLog) Description() string {
 func (plugin *PluginNxLog) Init(proxy *Proxy) error {
 	plugin.logger = Logger(proxy.logMaxSize, proxy.logMaxAge, proxy.logMaxBackups, proxy.nxLogFile)
 	plugin.format = proxy.nxLogFormat
+	plugin.ipCryptConfig = proxy.ipCryptConfig
 
 	return nil
 }
@@ -43,16 +44,15 @@ func (plugin *PluginNxLog) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 	if msg.Rcode != dns.RcodeNameError {
 		return nil
 	}
-	question := msg.Question[0]
-	qType, ok := dns.TypeToString[question.Qtype]
+	clientIPStr, ok := ExtractClientIPStrEncrypted(pluginsState, plugin.ipCryptConfig)
 	if !ok {
-		qType = string(qType)
+		// Ignore internal flow.
+		return nil
 	}
-	var clientIPStr string
-	if pluginsState.clientProto == "udp" {
-		clientIPStr = (*pluginsState.clientAddr).(*net.UDPAddr).IP.String()
-	} else {
-		clientIPStr = (*pluginsState.clientAddr).(*net.TCPAddr).IP.String()
+	question := msg.Question[0]
+	qType, ok := dns.TypeToString[dns.RRToType(question)]
+	if !ok {
+		qType = fmt.Sprintf("%d", dns.RRToType(question))
 	}
 	qName := pluginsState.qName
 

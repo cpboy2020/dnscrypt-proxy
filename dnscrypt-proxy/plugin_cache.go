@@ -3,23 +3,24 @@ package main
 import (
 	"crypto/sha512"
 	"encoding/binary"
+	"fmt"
 	"sync"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru"
-	"github.com/miekg/dns"
+	"codeberg.org/miekg/dns"
+	"github.com/jedisct1/go-sieve-cache/pkg/sievecache"
 )
 
 const StaleResponseTTL = 30 * time.Second
 
 type CachedResponse struct {
 	expiration time.Time
-	msg        dns.Msg
+	msg        *dns.Msg
 }
 
 type CachedResponses struct {
-	sync.RWMutex
-	cache *lru.ARCCache
+	cache     *sievecache.ShardedSieveCache[[32]byte, CachedResponse]
+	cacheOnce sync.Once
 }
 
 var cachedResponses CachedResponses
@@ -28,13 +29,13 @@ func computeCacheKey(pluginsState *PluginsState, msg *dns.Msg) [32]byte {
 	question := msg.Question[0]
 	h := sha512.New512_256()
 	var tmp [5]byte
-	binary.LittleEndian.PutUint16(tmp[0:2], question.Qtype)
-	binary.LittleEndian.PutUint16(tmp[2:4], question.Qclass)
+	binary.LittleEndian.PutUint16(tmp[0:2], dns.RRToType(question))
+	binary.LittleEndian.PutUint16(tmp[2:4], question.Header().Class)
 	if pluginsState.dnssec {
 		tmp[4] = 1
 	}
 	h.Write(tmp[:])
-	normalizedRawQName := []byte(question.Name)
+	normalizedRawQName := []byte(question.Header().Name)
 	NormalizeRawQName(&normalizedRawQName)
 	h.Write(normalizedRawQName)
 	var sum [32]byte
@@ -45,8 +46,7 @@ func computeCacheKey(pluginsState *PluginsState, msg *dns.Msg) [32]byte {
 
 // ---
 
-type PluginCache struct {
-}
+type PluginCache struct{}
 
 func (plugin *PluginCache) Name() string {
 	return "cache"
@@ -71,24 +71,18 @@ func (plugin *PluginCache) Reload() error {
 func (plugin *PluginCache) Eval(pluginsState *PluginsState, msg *dns.Msg) error {
 	cacheKey := computeCacheKey(pluginsState, msg)
 
-	cachedResponses.RLock()
 	if cachedResponses.cache == nil {
-		cachedResponses.RUnlock()
 		return nil
 	}
-	cachedAny, ok := cachedResponses.cache.Get(cacheKey)
+	cached, ok := cachedResponses.cache.Get(cacheKey)
 	if !ok {
-		cachedResponses.RUnlock()
 		return nil
 	}
-	cached := cachedAny.(CachedResponse)
 	expiration := cached.expiration
 	synth := cached.msg.Copy()
-	cachedResponses.RUnlock()
 
-	synth.Id = msg.Id
+	synth.ID = msg.ID
 	synth.Response = true
-	synth.Compress = true
 	synth.Question = msg.Question
 
 	if time.Now().After(expiration) {
@@ -108,8 +102,7 @@ func (plugin *PluginCache) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 
 // ---
 
-type PluginCacheResponse struct {
-}
+type PluginCacheResponse struct{}
 
 func (plugin *PluginCacheResponse) Name() string {
 	return "cache_response"
@@ -148,19 +141,23 @@ func (plugin *PluginCacheResponse) Eval(pluginsState *PluginsState, msg *dns.Msg
 	)
 	cachedResponse := CachedResponse{
 		expiration: time.Now().Add(ttl),
-		msg:        *msg,
+		msg:        msg.Copy(),
 	}
-	cachedResponses.Lock()
-	if cachedResponses.cache == nil {
-		var err error
-		cachedResponses.cache, err = lru.NewARC(pluginsState.cacheSize)
+	var cacheInitError error
+	cachedResponses.cacheOnce.Do(func() {
+		cache, err := sievecache.NewSharded[[32]byte, CachedResponse](pluginsState.cacheSize)
 		if err != nil {
-			cachedResponses.Unlock()
-			return err
+			cacheInitError = err
+		} else {
+			cachedResponses.cache = cache
 		}
+	})
+	if cacheInitError != nil {
+		return fmt.Errorf("failed to initialize the cache: %w", cacheInitError)
 	}
-	cachedResponses.cache.Add(cacheKey, cachedResponse)
-	cachedResponses.Unlock()
+	if cachedResponses.cache != nil {
+		cachedResponses.cache.Insert(cacheKey, cachedResponse)
+	}
 	updateTTL(msg, cachedResponse.expiration)
 
 	return nil

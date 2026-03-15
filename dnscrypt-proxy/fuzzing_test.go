@@ -1,12 +1,12 @@
 //go:build gofuzzbeta
-// +build gofuzzbeta
 
 package main
 
 import (
 	"encoding/hex"
-	stamps "github.com/jedisct1/go-dnsstamps"
 	"testing"
+
+	stamps "github.com/jedisct1/go-dnsstamps"
 )
 
 func FuzzParseODoHTargetConfigs(f *testing.F) {

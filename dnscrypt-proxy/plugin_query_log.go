@@ -4,18 +4,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"strings"
 	"time"
 
+	"codeberg.org/miekg/dns"
 	"github.com/jedisct1/dlog"
-	"github.com/miekg/dns"
 )
 
 type PluginQueryLog struct {
 	logger        io.Writer
 	format        string
 	ignoredQtypes []string
+	ipCryptConfig *IPCryptConfig
 }
 
 func (plugin *PluginQueryLog) Name() string {
@@ -30,6 +30,7 @@ func (plugin *PluginQueryLog) Init(proxy *Proxy) error {
 	plugin.logger = Logger(proxy.logMaxSize, proxy.logMaxAge, proxy.logMaxBackups, proxy.queryLogFile)
 	plugin.format = proxy.queryLogFormat
 	plugin.ignoredQtypes = proxy.queryLogIgnoredQtypes
+	plugin.ipCryptConfig = proxy.ipCryptConfig
 
 	return nil
 }
@@ -43,10 +44,15 @@ func (plugin *PluginQueryLog) Reload() error {
 }
 
 func (plugin *PluginQueryLog) Eval(pluginsState *PluginsState, msg *dns.Msg) error {
-	question := msg.Question[0]
-	qType, ok := dns.TypeToString[question.Qtype]
+	clientIPStr, ok := ExtractClientIPStrEncrypted(pluginsState, plugin.ipCryptConfig)
 	if !ok {
-		qType = string(qType)
+		// Ignore internal flow.
+		return nil
+	}
+	question := msg.Question[0]
+	qType, ok := dns.TypeToString[dns.RRToType(question)]
+	if !ok {
+		qType = fmt.Sprintf("%d", dns.RRToType(question))
 	}
 	if len(plugin.ignoredQtypes) > 0 {
 		for _, ignoredQtype := range plugin.ignoredQtypes {
@@ -54,12 +60,6 @@ func (plugin *PluginQueryLog) Eval(pluginsState *PluginsState, msg *dns.Msg) err
 				return nil
 			}
 		}
-	}
-	var clientIPStr string
-	if pluginsState.clientProto == "udp" {
-		clientIPStr = (*pluginsState.clientAddr).(*net.UDPAddr).IP.String()
-	} else {
-		clientIPStr = (*pluginsState.clientAddr).(*net.TCPAddr).IP.String()
 	}
 	qName := pluginsState.qName
 
@@ -73,13 +73,28 @@ func (plugin *PluginQueryLog) Eval(pluginsState *PluginsState, msg *dns.Msg) err
 	}
 	returnCode, ok := PluginsReturnCodeToString[pluginsState.returnCode]
 	if !ok {
-		returnCode = string(returnCode)
+		returnCode = fmt.Sprintf("%d", pluginsState.returnCode)
 	}
 
 	var requestDuration time.Duration
 	if !pluginsState.requestStart.IsZero() && !pluginsState.requestEnd.IsZero() {
 		requestDuration = pluginsState.requestEnd.Sub(pluginsState.requestStart)
+	} else {
+		// For incomplete queries, use timeout duration
+		requestDuration = pluginsState.timeout
 	}
+
+	// Cap at timeout to handle system sleep/suspend
+	// Max: UDP + TCP, Dial + (write + read)
+	triedUDPTCPTimeout := 4 * pluginsState.timeout
+	if requestDuration > triedUDPTCPTimeout {
+		requestDuration = triedUDPTCPTimeout
+	}
+	relayName := pluginsState.relayName
+	if relayName == "" {
+		relayName = "-"
+	}
+
 	var line string
 	if plugin.format == "tsv" {
 		now := time.Now()
@@ -87,7 +102,7 @@ func (plugin *PluginQueryLog) Eval(pluginsState *PluginsState, msg *dns.Msg) err
 		hour, minute, second := now.Clock()
 		tsStr := fmt.Sprintf("[%d-%02d-%02d %02d:%02d:%02d]", year, int(month), day, hour, minute, second)
 		line = fmt.Sprintf(
-			"%s\t%s\t%s\t%s\t%s\t%dms\t%s\n",
+			"%s\t%s\t%s\t%s\t%s\t%dms\t%s\t%s\n",
 			tsStr,
 			clientIPStr,
 			StringQuote(qName),
@@ -95,14 +110,15 @@ func (plugin *PluginQueryLog) Eval(pluginsState *PluginsState, msg *dns.Msg) err
 			returnCode,
 			requestDuration/time.Millisecond,
 			StringQuote(pluginsState.serverName),
+			StringQuote(relayName),
 		)
 	} else if plugin.format == "ltsv" {
 		cached := 0
 		if pluginsState.cacheHit {
 			cached = 1
 		}
-		line = fmt.Sprintf("time:%d\thost:%s\tmessage:%s\ttype:%s\treturn:%s\tcached:%d\tduration:%d\tserver:%s\n",
-			time.Now().Unix(), clientIPStr, StringQuote(qName), qType, returnCode, cached, requestDuration/time.Millisecond, StringQuote(pluginsState.serverName))
+		line = fmt.Sprintf("time:%d\thost:%s\tmessage:%s\ttype:%s\treturn:%s\tcached:%d\tduration:%d\tserver:%s\trelay:%s\n",
+			time.Now().Unix(), clientIPStr, StringQuote(qName), qType, returnCode, cached, requestDuration/time.Millisecond, StringQuote(pluginsState.serverName), StringQuote(relayName))
 	} else {
 		dlog.Fatalf("Unexpected log format: [%s]", plugin.format)
 	}

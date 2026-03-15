@@ -8,6 +8,8 @@ import argparse
 import re
 import sys
 import fnmatch
+import concurrent.futures
+import time
 
 try:
     import urllib2 as urllib
@@ -20,8 +22,10 @@ except (ImportError, ModuleNotFoundError):
     URLLIB_NEW = True
 
 
-log_info = sys.stderr
-log_err = sys.stderr
+def setup_logging(output_file=None):
+    log_info = sys.stdout if output_file else sys.stderr
+    log_err = sys.stderr
+    return log_info, log_err
 
 
 def parse_trusted_list(content):
@@ -93,8 +97,7 @@ def parse_list(content, trusted=False):
 
 def print_restricted_name(output_fd, name, time_restrictions):
     if name in time_restrictions:
-        print("{}\t{}".format(
-            name, time_restrictions[name]), file=output_fd, end="\n")
+        print("{}\t{}".format(name, time_restrictions[name]), file=output_fd, end="\n")
     else:
         print(
             "# ignored: [{}] was in the time-restricted list, "
@@ -104,8 +107,7 @@ def print_restricted_name(output_fd, name, time_restrictions):
         )
 
 
-def load_from_url(url):
-    log_info.write("Loading data from [{}]\n".format(url))
+def load_from_url(url, timeout):
     req = urllib.Request(url=url, headers={"User-Agent": "dnscrypt-proxy"})
     trusted = False
 
@@ -118,13 +120,12 @@ def load_from_url(url):
 
     response = None
     try:
-        response = urllib.urlopen(req, timeout=int(args.timeout))
-    except urllib.URLError as err:
-        raise Exception("[{}] could not be loaded: {}\n".format(url, err))
+        response = urllib.urlopen(req, timeout=int(timeout))
+        content = response.read() # "The read operation timed out"
+    except Exception as err:
+        raise Exception("[{}] could not be loaded: {}".format(url, err))
     if trusted is False and response.getcode() != 200:
-        raise Exception("[{}] returned HTTP code {}\n".format(
-            url, response.getcode()))
-    content = response.read()
+        raise Exception("[{}] returned HTTP code {}".format(url, response.getcode()))
     if URLLIB_NEW:
         content = content.decode("utf-8", errors="replace")
 
@@ -173,45 +174,105 @@ def has_suffix(names, name):
         parts = parts[1:]
         if str.join(".", parts) in names:
             return True
-
     return False
 
 
-def allowlist_from_url(url):
+def allowlist_from_url(url, timeout):
     if not url:
         return set()
-    content, trusted = load_from_url(url)
+    content, trusted = load_from_url(url, timeout)
 
     names, _time_restrictions, _globs = parse_list(content, trusted)
     return names
 
+STOP_RETRY = False
 
-def blocklists_from_config_file(
-    file, allowlist, time_restricted_url, ignore_retrieval_failure, output_file
-):
+def load_url_with_retry(url, timeout, tries=3, retry_delay=2):
+    log_info, log_err = setup_logging()
+    for attempt in range(tries):
+        try_msg = f"try: {attempt + 1}/{tries}"
+        try:
+            log_info.write(f"[{try_msg}] Loading data from [{url}]\n")
+            content, trusted = load_from_url(url, timeout)
+            log_err.write(f"[{try_msg}] [{url}] OK\n")
+            return content, trusted
+        except Exception as e:
+            log_err.write(f"[{try_msg}] {e}\n")
+            if STOP_RETRY:
+                break
+            if attempt < tries - 1:
+                time.sleep(retry_delay)
+            else:
+                raise e
+
+
+def load_blocklists_parallel(urls, timeout, ignore_retrieval_failure):
+    log_info, log_err = setup_logging()
     blocklists = {}
-    allowed_names = set()
     all_names = set()
-    unique_names = set()
     all_globs = set()
 
-    # Load conf & blocklists
-    with open(file) as fd:
-        for line in fd:
-            line = str.strip(line)
-            if str.startswith(line, "#") or line == "":
-                continue
-            url = line
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_url = {
+            executor.submit(load_url_with_retry, url, timeout): url
+            for url in urls
+        }
+
+        # Useful for bad network situations
+        return_when = concurrent.futures.FIRST_EXCEPTION
+        if ignore_retrieval_failure:
+            return_when = concurrent.futures.ALL_COMPLETED
+        finished, unfinished = concurrent.futures.wait(future_to_url, None, return_when)
+        # Return early
+        if len(unfinished) > 0:
+            # Cancel unstarted tasks
+            for f in unfinished:
+                if not f.done():
+                    f.cancel()
+            # Stop retries
+            global STOP_RETRY
+            STOP_RETRY = True
+            # Threads won't be terminated forcibly
+            if not ignore_retrieval_failure:
+                sys.exit(1)
+
+        for future in finished:
+            url = future_to_url[future]
             try:
-                content, trusted = load_from_url(url)
+                content, trusted = future.result()
                 names, _time_restrictions, globs = parse_list(content, trusted)
                 blocklists[url] = names
                 all_names |= names
                 all_globs |= globs
             except Exception as e:
-                log_err.write(str(e))
+                log_err.write(f"{e}\n")
                 if not ignore_retrieval_failure:
-                    exit(1)
+                    sys.exit(1)
+
+    return blocklists, all_names, all_globs
+
+
+def blocklists_from_config_file(
+    file, allowlist, time_restricted_url, ignore_retrieval_failure, output_file, timeout
+):
+    log_info, log_err = setup_logging(output_file)
+
+    # Get URLs from config file
+    urls = []
+    with open(file) as fd:
+        for line in fd:
+            line = str.strip(line)
+            if str.startswith(line, "#") or line == "":
+                continue
+            urls.append(line)
+
+    # Load blocklists in parallel
+    blocklists, all_names, all_globs = load_blocklists_parallel(
+        urls, timeout, ignore_retrieval_failure
+    )
+
+    # Load allowed names
+    allowed_names = set()
 
     # Time-based blocklist
     if time_restricted_url and not re.match(r"^[a-z0-9]+:", time_restricted_url):
@@ -222,28 +283,39 @@ def blocklists_from_config_file(
         output_fd = open(output_file, "w")
 
     if time_restricted_url:
-        time_restricted_content, _trusted = load_from_url(time_restricted_url)
-        time_restricted_names, time_restrictions, _globs = parse_trusted_list(
-            time_restricted_content
-        )
-
-        if time_restricted_names:
-            print(
-                "########## Time-based blocklist ##########\n", file=output_fd, end="\n"
+        try:
+            time_restricted_content, _trusted = load_from_url(
+                time_restricted_url, timeout
             )
-            for name in time_restricted_names:
-                print_restricted_name(output_fd, name, time_restrictions)
+            time_restricted_names, time_restrictions, _globs = parse_trusted_list(
+                time_restricted_content
+            )
 
-        # Time restricted names should be allowed, or they could be always blocked
-        allowed_names |= time_restricted_names
+            if time_restricted_names:
+                print(
+                    "########## Time-based blocklist ##########\n",
+                    file=output_fd,
+                    end="\n",
+                )
+                for name in time_restricted_names:
+                    print_restricted_name(output_fd, name, time_restrictions)
+
+            # Time restricted names should be allowed, or they could be always blocked
+            allowed_names |= time_restricted_names
+        except Exception as e:
+            log_err.write(f"Error loading time-restricted list: {str(e)}\n")
 
     # Allowed list
     if allowlist and not re.match(r"^[a-z0-9]+:", allowlist):
         allowlist = "file:" + allowlist
 
-    allowed_names |= allowlist_from_url(allowlist)
+    try:
+        allowed_names |= allowlist_from_url(allowlist, timeout)
+    except Exception as e:
+        log_err.write(f"Error loading allowlist: {str(e)}\n")
 
     # Process blocklists
+    unique_names = set()
     for url, names in blocklists.items():
         print(
             "\n\n########## Blocklist from {} ##########\n".format(url),
@@ -251,7 +323,7 @@ def blocklists_from_config_file(
             end="\n",
         )
         ignored, glob_ignored, allowed = 0, 0, 0
-        list_names = list()
+        list_names = []
         for name in names:
             if covered_by_glob(all_globs, name):
                 glob_ignored = glob_ignored + 1
@@ -265,12 +337,10 @@ def blocklists_from_config_file(
 
         list_names.sort(key=name_cmp)
         if ignored:
-            print("# Ignored duplicates: {}".format(
-                ignored), file=output_fd, end="\n")
+            print("# Ignored duplicates: {}".format(ignored), file=output_fd, end="\n")
         if glob_ignored:
             print(
-                "# Ignored due to overlapping local patterns: {}".format(
-                    glob_ignored),
+                "# Ignored due to overlapping local patterns: {}".format(glob_ignored),
                 file=output_fd,
                 end="\n",
             )
@@ -288,64 +358,82 @@ def blocklists_from_config_file(
     output_fd.close()
 
 
-argp = argparse.ArgumentParser(
-    description="Create a unified blocklist from a set of local and remote files"
-)
-argp.add_argument(
-    "-c",
-    "--config",
-    default="domains-blocklist.conf",
-    help="file containing blocklist sources",
-)
-argp.add_argument(
-    "-w",
-    "--whitelist",
-    help=argparse.SUPPRESS,
-)
-argp.add_argument(
-    "-a",
-    "--allowlist",
-    default="domains-allowlist.txt",
-    help="file containing a set of names to exclude from the blocklist",
-)
-argp.add_argument(
-    "-r",
-    "--time-restricted",
-    default="domains-time-restricted.txt",
-    help="file containing a set of names to be time restricted",
-)
-argp.add_argument(
-    "-i",
-    "--ignore-retrieval-failure",
-    action="store_true",
-    help="generate list even if some urls couldn't be retrieved",
-)
-argp.add_argument(
-    "-o",
-    "--output-file",
-    default=None,
-    help="save generated blocklist to a text file with the provided file name",
-)
-argp.add_argument("-t", "--timeout", default=30, help="URL open timeout")
-
-args = argp.parse_args()
-
-whitelist = args.whitelist
-if whitelist:
-    print(
-        "The option to provide a set of names to exclude from the blocklist has been changed from -w to -a\n"
+def main():
+    argp = argparse.ArgumentParser(
+        description="Create a unified blocklist from a set of local and remote files"
     )
-    argp.print_help()
-    exit(1)
+    argp.add_argument(
+        "-c",
+        "--config",
+        default="domains-blocklist.conf",
+        help="file containing blocklist sources",
+    )
+    argp.add_argument(
+        "-w",
+        "--whitelist",
+        help=argparse.SUPPRESS,
+    )
+    argp.add_argument(
+        "-a",
+        "--allowlist",
+        default="domains-allowlist.txt",
+        help="file containing a set of names to exclude from the blocklist",
+    )
+    argp.add_argument(
+        "-r",
+        "--time-restricted",
+        default="domains-time-restricted.txt",
+        help="file containing a set of names to be time restricted",
+    )
+    argp.add_argument(
+        "-i",
+        "--ignore-retrieval-failure",
+        action="store_true",
+        help="generate list even if some urls couldn't be retrieved",
+    )
+    argp.add_argument(
+        "-o",
+        "--output-file",
+        default=None,
+        help="save generated blocklist to a text file with the provided file name",
+    )
+    argp.add_argument("-t", "--timeout", default=30, help="URL open timeout in seconds")
+    argp.add_argument(
+        "-p",
+        "--progress",
+        action="store_true",
+        help="show download progress information",
+    )
 
-conf = args.config
-allowlist = args.allowlist
-time_restricted = args.time_restricted
-ignore_retrieval_failure = args.ignore_retrieval_failure
-output_file = args.output_file
-if output_file:
-    log_info = sys.stdout
+    args = argp.parse_args()
 
-blocklists_from_config_file(
-    conf, allowlist, time_restricted, ignore_retrieval_failure, output_file
-)
+    whitelist = args.whitelist
+    if whitelist:
+        print(
+            "The option to provide a set of names to exclude from the blocklist has been changed from -w to -a\n"
+        )
+        argp.print_help()
+        exit(1)
+
+    start_time = time.time()
+
+    log_info, _ = setup_logging(args.output_file)
+    if args.progress:
+        log_info.write("Starting blocklist generation...\n")
+
+    blocklists_from_config_file(
+        args.config,
+        args.allowlist,
+        args.time_restricted,
+        args.ignore_retrieval_failure,
+        args.output_file,
+        args.timeout,
+    )
+
+    if args.progress:
+        duration = time.time() - start_time
+        log_info.write(f"Blocklist generation completed in {duration:.2f} seconds\n")
+
+
+if __name__ == "__main__":
+    main()

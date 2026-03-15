@@ -2,7 +2,8 @@
 #        IP blocklist        #
 ##############################
 
-## Rules for IP-based response blocking
+## Rules for blocking DNS responses if they contain
+## IP addresses matching patterns.
 ##
 ## Sample feeds of suspect IP addresses:
 ## - https://github.com/stamparm/ipsum
@@ -14,3 +15,5 @@
 163.5.1.4
 94.46.118.*
 fe80:53:*          # IPv6 prefix example
+10.0.0.0/8         # CIDR network mask
+fe80::/10          # IPv6 CIDR network mask

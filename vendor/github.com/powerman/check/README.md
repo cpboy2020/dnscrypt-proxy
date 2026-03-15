@@ -1,4 +1,12 @@
-# check [![GoDoc](https://godoc.org/github.com/powerman/check?status.svg)](http://godoc.org/github.com/powerman/check) [![Go Report Card](https://goreportcard.com/badge/github.com/powerman/check)](https://goreportcard.com/report/github.com/powerman/check) [![CircleCI](https://circleci.com/gh/powerman/check.svg?style=svg)](https://circleci.com/gh/powerman/check) [![Coverage Status](https://coveralls.io/repos/github/powerman/check/badge.svg?branch=master)](https://coveralls.io/github/powerman/check?branch=master)
+# check
+
+[![License MIT](https://img.shields.io/badge/license-MIT-royalblue.svg)](LICENSE)
+[![Go version](https://img.shields.io/github/go-mod/go-version/powerman/check?color=blue)](https://go.dev/)
+[![Test](https://img.shields.io/github/actions/workflow/status/powerman/check/test.yml?label=test)](https://github.com/powerman/check/actions/workflows/test.yml)
+[![Coverage Status](https://raw.githubusercontent.com/powerman/check/gh-badges/coverage.svg)](https://github.com/powerman/check/actions/workflows/test.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/powerman/check)](https://goreportcard.com/report/github.com/powerman/check)
+[![Release](https://img.shields.io/github/v/release/powerman/check?color=blue)](https://github.com/powerman/check/releases/latest)
+[![Go Reference](https://pkg.go.dev/badge/github.com/powerman/check.svg)](https://pkg.go.dev/github.com/powerman/check)
 
 Helpers to complement Go [testing](https://golang.org/pkg/testing/)
 package.
@@ -12,10 +20,10 @@ on steroids. :)
 ## Features
 
 - Compelling output from failed tests:
-    - Very easy-to-read dumps for expected and actual values.
-    - Same text diff you loved in testify/assert.
-    - Also visual diff in [GoConvey](http://goconvey.co/) web UI, if you
-      use it (recommended).
+  - Very easy-to-read dumps for expected and actual values.
+  - Same text diff you loved in testify/assert.
+  - Also visual diff in [GoConvey](http://goconvey.co/) web UI, if you
+    use it (recommended).
 - Statistics with amount of passed/failed checks.
 - Colored output in terminal.
 - 100% compatible with testing package - check package just provide
@@ -35,18 +43,18 @@ package to have more clean/concise test code and cool dump/diff.
 import "github.com/powerman/check"
 
 func TestSomething(tt *testing.T) {
-	t := check.T(tt)
-	t.Equal(2, 2)
-	t.Log("You can use new t just like usual *testing.T")
-	t.Run("Subtests/Parallel example", func(tt *testing.T) {
-		t := check.T(tt)
-		t.Parallel()
-		t.NotEqual(2, 3, "should not be 3!")
-		obj, err := NewObj()
-		if t.Nil(err) {
-			t.Match(obj.field, `^\d+$`)
-		}
-	})
+    t := check.T(tt)
+    t.Equal(2, 2)
+    t.Log("You can use new t just like usual *testing.T")
+    t.Run("Subtests/Parallel example", func(tt *testing.T) {
+        t := check.T(tt)
+        t.Parallel()
+        t.NotEqual(2, 3, "should not be 3!")
+        obj, err := NewObj()
+        if t.Nil(err) {
+            t.Match(obj.field, `^\d+$`)
+        }
+    })
 }
 ```
 
@@ -67,7 +75,7 @@ import _ "github.com/smartystreets/goconvey/convey"
 
 Require [Go 1.9](https://golang.org/doc/go1.9#test-helper).
 
-```
+```sh
 go get github.com/powerman/check
 ```
 
@@ -84,5 +92,5 @@ go get github.com/powerman/check
 - Complicated:
   - [ ] Show line of source_test.go with failed test (like gocheck).
   - [ ] Auto-detect missed `t:=check.T(tt)` - try to intercept `Run()` and
-    `Parallel()` for detecting using wrong `t` (looks like golangci-lint's
-    tparallel catch at least `Parallel()` case).
+        `Parallel()` for detecting using wrong `t` (looks like golangci-lint's
+        tparallel catch at least `Parallel()` case).

@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"codeberg.org/miekg/dns"
 	"github.com/jedisct1/dlog"
-	"github.com/miekg/dns"
 )
 
 type PluginsAction int
@@ -70,12 +70,14 @@ type PluginsState struct {
 	requestEnd                       time.Time
 	clientProto                      string
 	serverName                       string
+	relayName                        string
 	serverProto                      string
 	qName                            string
 	clientAddr                       *net.Addr
 	synthResponse                    *dns.Msg
 	questionMsg                      *dns.Msg
-	sessionData                      map[string]interface{}
+	xTransport                       *XTransport
+	sessionData                      map[string]any
 	action                           PluginsAction
 	timeout                          time.Duration
 	returnCode                       PluginsReturnCode
@@ -189,23 +191,23 @@ func parseBlockedQueryResponse(blockedResponse string, pluginsGlobals *PluginsGl
 
 	if strings.HasPrefix(blockedResponse, "a:") {
 		blockedIPStrings := strings.Split(blockedResponse, ",")
-		(*pluginsGlobals).respondWithIPv4 = net.ParseIP(strings.TrimPrefix(blockedIPStrings[0], "a:"))
+		pluginsGlobals.respondWithIPv4 = net.ParseIP(strings.TrimPrefix(blockedIPStrings[0], "a:"))
 
-		if (*pluginsGlobals).respondWithIPv4 == nil {
+		if pluginsGlobals.respondWithIPv4 == nil {
 			dlog.Notice("Error parsing IPv4 response given in blocked_query_response option, defaulting to `hinfo`")
-			(*pluginsGlobals).refusedCodeInResponses = false
+			pluginsGlobals.refusedCodeInResponses = false
 			return
 		}
 
 		if len(blockedIPStrings) > 1 {
-			if strings.HasPrefix(blockedIPStrings[1], "aaaa:") {
-				ipv6Response := strings.TrimPrefix(blockedIPStrings[1], "aaaa:")
+			if after, ok := strings.CutPrefix(blockedIPStrings[1], "aaaa:"); ok {
+				ipv6Response := after
 				if strings.HasPrefix(ipv6Response, "[") {
 					ipv6Response = strings.Trim(ipv6Response, "[]")
 				}
-				(*pluginsGlobals).respondWithIPv6 = net.ParseIP(ipv6Response)
+				pluginsGlobals.respondWithIPv6 = net.ParseIP(ipv6Response)
 
-				if (*pluginsGlobals).respondWithIPv6 == nil {
+				if pluginsGlobals.respondWithIPv6 == nil {
 					dlog.Notice(
 						"Error parsing IPv6 response given in blocked_query_response option, defaulting to IPv4",
 					)
@@ -215,18 +217,18 @@ func parseBlockedQueryResponse(blockedResponse string, pluginsGlobals *PluginsGl
 			}
 		}
 
-		if (*pluginsGlobals).respondWithIPv6 == nil {
-			(*pluginsGlobals).respondWithIPv6 = (*pluginsGlobals).respondWithIPv4
+		if pluginsGlobals.respondWithIPv6 == nil {
+			pluginsGlobals.respondWithIPv6 = pluginsGlobals.respondWithIPv4
 		}
 	} else {
 		switch blockedResponse {
 		case "refused":
-			(*pluginsGlobals).refusedCodeInResponses = true
+			pluginsGlobals.refusedCodeInResponses = true
 		case "hinfo":
-			(*pluginsGlobals).refusedCodeInResponses = false
+			pluginsGlobals.refusedCodeInResponses = false
 		default:
 			dlog.Noticef("Invalid blocked_query_response option [%s], defaulting to `hinfo`", blockedResponse)
-			(*pluginsGlobals).refusedCodeInResponses = false
+			pluginsGlobals.refusedCodeInResponses = false
 		}
 	}
 }
@@ -266,62 +268,67 @@ func NewPluginsState(
 		timeout:                          proxy.timeout,
 		requestStart:                     start,
 		maxUnencryptedUDPSafePayloadSize: MaxDNSUDPSafePacketSize,
-		sessionData:                      make(map[string]interface{}),
+		sessionData:                      make(map[string]any),
+		xTransport:                       proxy.xTransport,
 	}
 }
 
 func (pluginsState *PluginsState) ApplyQueryPlugins(
 	pluginsGlobals *PluginsGlobals,
 	packet []byte,
-	needsEDNS0Padding bool,
+	getServerInfo func() (*ServerInfo, bool),
 ) ([]byte, error) {
-	msg := dns.Msg{}
-	if err := msg.Unpack(packet); err != nil {
+	msg := dns.Msg{Data: packet}
+	if err := msg.Unpack(); err != nil {
 		return packet, err
 	}
 	if len(msg.Question) != 1 {
 		return packet, errors.New("Unexpected number of questions")
 	}
-	qName, err := NormalizeQName(msg.Question[0].Name)
+	qName, err := NormalizeQName(msg.Question[0].Header().Name)
 	if err != nil {
 		return packet, err
 	}
 	dlog.Debugf("Handling query for [%v]", qName)
 	pluginsState.qName = qName
 	pluginsState.questionMsg = &msg
-	if len(*pluginsGlobals.queryPlugins) == 0 && len(*pluginsGlobals.loggingPlugins) == 0 {
-		return packet, nil
+	if len(*pluginsGlobals.queryPlugins) > 0 {
+		pluginsGlobals.RLock()
+		for _, plugin := range *pluginsGlobals.queryPlugins {
+			if err := plugin.Eval(pluginsState, &msg); err != nil {
+				dlog.Debugf("Dropping query: %v", err)
+				pluginsState.action = PluginsActionDrop
+				pluginsGlobals.RUnlock()
+				return packet, err
+			}
+			if pluginsState.action == PluginsActionReject {
+				synth := RefusedResponseFromMessage(
+					&msg,
+					pluginsGlobals.refusedCodeInResponses,
+					pluginsGlobals.respondWithIPv4,
+					pluginsGlobals.respondWithIPv6,
+					pluginsState.rejectTTL,
+				)
+				pluginsState.synthResponse = synth
+			}
+			if pluginsState.action != PluginsActionContinue {
+				break
+			}
+		}
+		pluginsGlobals.RUnlock()
 	}
-	pluginsGlobals.RLock()
-	defer pluginsGlobals.RUnlock()
-	for _, plugin := range *pluginsGlobals.queryPlugins {
-		if err := plugin.Eval(pluginsState, &msg); err != nil {
-			pluginsState.action = PluginsActionDrop
-			return packet, err
-		}
-		if pluginsState.action == PluginsActionReject {
-			synth := RefusedResponseFromMessage(
-				&msg,
-				pluginsGlobals.refusedCodeInResponses,
-				pluginsGlobals.respondWithIPv4,
-				pluginsGlobals.respondWithIPv6,
-				pluginsState.rejectTTL,
-			)
-			pluginsState.synthResponse = synth
-		}
-		if pluginsState.action != PluginsActionContinue {
-			break
-		}
-	}
-
-	packet2, err := msg.PackBuffer(packet)
-	if err != nil {
+	if err := msg.Pack(); err != nil {
 		return packet, err
 	}
-	if needsEDNS0Padding && pluginsState.action == PluginsActionContinue {
-		padLen := 63 - ((len(packet2) + 63) & 63)
-		if paddedPacket2, _ := addEDNS0PaddingIfNoneFound(&msg, packet2, padLen); paddedPacket2 != nil {
-			return paddedPacket2, nil
+	packet2 := msg.Data
+	// Only get server info if we're continuing and need padding
+	if pluginsState.action == PluginsActionContinue && getServerInfo != nil {
+		_, needsEDNS0Padding := getServerInfo()
+		if needsEDNS0Padding {
+			padLen := 63 - ((len(packet2) + 63) & 63)
+			if paddedPacket2, _ := addEDNS0PaddingIfNoneFound(&msg, packet2, padLen); paddedPacket2 != nil {
+				return paddedPacket2, nil
+			}
 		}
 	}
 	return packet2, nil
@@ -330,10 +337,9 @@ func (pluginsState *PluginsState) ApplyQueryPlugins(
 func (pluginsState *PluginsState) ApplyResponsePlugins(
 	pluginsGlobals *PluginsGlobals,
 	packet []byte,
-	ttl *uint32,
 ) ([]byte, error) {
-	msg := dns.Msg{Compress: true}
-	if err := msg.Unpack(packet); err != nil {
+	msg := dns.Msg{Data: packet}
+	if err := msg.Unpack(); err != nil {
 		if len(packet) >= MinDNSPacketSize && HasTCFlag(packet) {
 			err = nil
 		}
@@ -350,35 +356,35 @@ func (pluginsState *PluginsState) ApplyResponsePlugins(
 		pluginsState.returnCode = PluginsReturnCodeResponseError
 	}
 	removeEDNS0Options(&msg)
-	pluginsGlobals.RLock()
-	defer pluginsGlobals.RUnlock()
-	for _, plugin := range *pluginsGlobals.responsePlugins {
-		if err := plugin.Eval(pluginsState, &msg); err != nil {
-			pluginsState.action = PluginsActionDrop
-			return packet, err
+	if len(*pluginsGlobals.responsePlugins) > 0 {
+		pluginsGlobals.RLock()
+		for _, plugin := range *pluginsGlobals.responsePlugins {
+			if err := plugin.Eval(pluginsState, &msg); err != nil {
+				dlog.Debugf("Dropping response: %v", err)
+				pluginsState.action = PluginsActionDrop
+				pluginsGlobals.RUnlock()
+				return packet, err
+			}
+			if pluginsState.action == PluginsActionReject {
+				synth := RefusedResponseFromMessage(
+					&msg,
+					pluginsGlobals.refusedCodeInResponses,
+					pluginsGlobals.respondWithIPv4,
+					pluginsGlobals.respondWithIPv6,
+					pluginsState.rejectTTL,
+				)
+				pluginsState.synthResponse = synth
+			}
+			if pluginsState.action != PluginsActionContinue {
+				break
+			}
 		}
-		if pluginsState.action == PluginsActionReject {
-			synth := RefusedResponseFromMessage(
-				&msg,
-				pluginsGlobals.refusedCodeInResponses,
-				pluginsGlobals.respondWithIPv4,
-				pluginsGlobals.respondWithIPv6,
-				pluginsState.rejectTTL,
-			)
-			pluginsState.synthResponse = synth
-		}
-		if pluginsState.action != PluginsActionContinue {
-			break
-		}
+		pluginsGlobals.RUnlock()
 	}
-	if ttl != nil {
-		setMaxTTL(&msg, *ttl)
-	}
-	packet2, err := msg.PackBuffer(packet)
-	if err != nil {
+	if err := msg.Pack(); err != nil {
 		return packet, err
 	}
-	return packet2, nil
+	return msg.Data, nil
 }
 
 func (pluginsState *PluginsState) ApplyLoggingPlugins(pluginsGlobals *PluginsGlobals) error {

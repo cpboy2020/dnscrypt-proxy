@@ -4,12 +4,19 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"io/ioutil"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
+
+	iradix "github.com/hashicorp/go-immutable-radix"
+	"github.com/jedisct1/dlog"
+	"github.com/k-sone/critbitgo"
 )
 
 type CryptoConstruction uint16
@@ -41,15 +48,11 @@ var (
 var (
 	FileDescriptors   = make([]*os.File, 0)
 	FileDescriptorNum = uintptr(0)
+	FileDescriptorsMu sync.Mutex
 )
 
 const (
 	InheritedDescriptorsBase = uintptr(50)
-)
-
-const (
-	IPv4Arpa = "in-addr.arpa"
-	IPv6Arpa = "ip6.arpa"
 )
 
 func PrefixWithSize(packet []byte) ([]byte, error) {
@@ -150,6 +153,8 @@ func TrimAndStripInlineComments(str string) string {
 	return strings.TrimSpace(str)
 }
 
+// ExtractHostAndPort parses a string containing a host and optional port.
+// If no port is present or cannot be parsed, the defaultPort is returned.
 func ExtractHostAndPort(str string, defaultPort int) (host string, port int) {
 	host, port = str, defaultPort
 	if idx := strings.LastIndex(str, ":"); idx >= 0 && idx < len(str)-1 {
@@ -157,14 +162,229 @@ func ExtractHostAndPort(str string, defaultPort int) (host string, port int) {
 			host, port = host[:idx], portX
 		}
 	}
-	return
+	return host, port
 }
 
+// ReadTextFile reads a file and returns its contents as a string.
+// It automatically removes UTF-8 BOM if present.
 func ReadTextFile(filename string) (string, error) {
-	bin, err := ioutil.ReadFile(filename)
+	bin, err := os.ReadFile(filename)
 	if err != nil {
 		return "", err
 	}
+	// Remove UTF-8 BOM if present
 	bin = bytes.TrimPrefix(bin, []byte{0xef, 0xbb, 0xbf})
 	return string(bin), nil
+}
+
+func isDigit(b byte) bool { return b >= '0' && b <= '9' }
+
+// ExtractClientIPStr extracts client IP string from pluginsState based on protocol
+func ExtractClientIPStr(pluginsState *PluginsState) (string, bool) {
+	if pluginsState.clientAddr == nil {
+		return "", false
+	}
+	switch pluginsState.clientProto {
+	case "udp":
+		return (*pluginsState.clientAddr).(*net.UDPAddr).IP.String(), true
+	case "tcp", "local_doh":
+		return (*pluginsState.clientAddr).(*net.TCPAddr).IP.String(), true
+	default:
+		return "", false
+	}
+}
+
+// ExtractClientIPStrEncrypted extracts and optionally encrypts client IP string
+func ExtractClientIPStrEncrypted(pluginsState *PluginsState, ipCryptConfig *IPCryptConfig) (string, bool) {
+	ipStr, ok := ExtractClientIPStr(pluginsState)
+	if !ok || ipCryptConfig == nil {
+		return ipStr, ok
+	}
+	return ipCryptConfig.EncryptIPString(ipStr), ok
+}
+
+// FormatLogLine formats a log line based on the specified format (tsv or ltsv)
+func FormatLogLine(format, clientIP, qName, reason string, additionalFields ...string) (string, error) {
+	if format == "tsv" {
+		now := time.Now()
+		year, month, day := now.Date()
+		hour, minute, second := now.Clock()
+		tsStr := fmt.Sprintf("[%d-%02d-%02d %02d:%02d:%02d]", year, int(month), day, hour, minute, second)
+
+		var line strings.Builder
+		line.WriteString(fmt.Sprintf("%s\t%s\t%s\t%s", tsStr, clientIP, StringQuote(qName), StringQuote(reason)))
+		for _, field := range additionalFields {
+			line.WriteString(fmt.Sprintf("\t%s", StringQuote(field)))
+		}
+		return line.String() + "\n", nil
+	} else if format == "ltsv" {
+		var line strings.Builder
+		line.WriteString(fmt.Sprintf("time:%d\thost:%s\tqname:%s\tmessage:%s", time.Now().Unix(), clientIP, StringQuote(qName), StringQuote(reason)))
+
+		// For LTSV format, additional fields are added with specific labels
+		for i, field := range additionalFields {
+			if i == 0 {
+				line.WriteString(fmt.Sprintf("\tip:%s", StringQuote(field)))
+			} else {
+				line.WriteString(fmt.Sprintf("\tfield%d:%s", i, StringQuote(field)))
+			}
+		}
+		return line.String() + "\n", nil
+	}
+	return "", fmt.Errorf("unexpected log format: [%s]", format)
+}
+
+// WritePluginLog writes a log entry for plugin actions
+func WritePluginLog(logger io.Writer, format, clientIP, qName, reason string, additionalFields ...string) error {
+	if logger == nil {
+		return errors.New("Log file not initialized")
+	}
+
+	line, err := FormatLogLine(format, clientIP, qName, reason, additionalFields...)
+	if err != nil {
+		return err
+	}
+
+	_, err = logger.Write([]byte(line))
+	return err
+}
+
+// ParseTimeBasedRule parses a rule line that may contain time-based restrictions (@timerange)
+func ParseTimeBasedRule(line string, lineNo int, allWeeklyRanges *map[string]WeeklyRanges) (rulePart string, weeklyRanges *WeeklyRanges, err error) {
+	parts := strings.Split(line, "@")
+	timeRangeName := ""
+
+	if len(parts) == 2 {
+		rulePart = strings.TrimSpace(parts[0])
+		timeRangeName = strings.TrimSpace(parts[1])
+	} else if len(parts) > 2 {
+		return "", nil, fmt.Errorf("syntax error at line %d -- Unexpected @ character", 1+lineNo)
+	} else {
+		rulePart = line
+	}
+
+	if len(timeRangeName) > 0 {
+		if weeklyRangesX, ok := (*allWeeklyRanges)[timeRangeName]; ok {
+			weeklyRanges = &weeklyRangesX
+		} else {
+			return "", nil, fmt.Errorf("time range [%s] not found at line %d", timeRangeName, 1+lineNo)
+		}
+	}
+
+	return rulePart, weeklyRanges, nil
+}
+
+// ParseIPRule parses and validates an IP rule line
+func ParseIPRule(line string, lineNo int) (cleanLine string, trailingStar bool, err error) {
+	ip := net.ParseIP(line)
+	trailingStar = strings.HasSuffix(line, "*")
+
+	if len(line) < 2 || (ip != nil && trailingStar) {
+		return "", false, fmt.Errorf("suspicious IP rule [%s] at line %d", line, lineNo)
+	}
+
+	cleanLine = line
+	if trailingStar {
+		cleanLine = cleanLine[:len(cleanLine)-1]
+	}
+	if strings.HasSuffix(cleanLine, ":") || strings.HasSuffix(cleanLine, ".") {
+		cleanLine = cleanLine[:len(cleanLine)-1]
+	}
+	if len(cleanLine) == 0 {
+		return "", false, fmt.Errorf("empty IP rule at line %d", lineNo)
+	}
+	if strings.Contains(cleanLine, "*") {
+		return "", false, fmt.Errorf("invalid rule: [%s] - wildcards can only be used as a suffix at line %d", line, lineNo)
+	}
+
+	return strings.ToLower(cleanLine), trailingStar, nil
+}
+
+// ProcessConfigLines processes configuration file lines, calling the processor function for each non-empty line
+func ProcessConfigLines(lines string, processor func(line string, lineNo int) error) error {
+	for lineNo, line := range strings.Split(lines, "\n") {
+		line = TrimAndStripInlineComments(line)
+		if len(line) == 0 {
+			continue
+		}
+		if err := processor(line, lineNo); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// LoadIPRules loads IP rules from text lines into three structures:
+//   - ips (map): exact IP addresses
+//   - prefixes (radix tree): wildcard prefix rules (e.g. "192.168.*")
+//   - networks (critbit net): CIDR network masks (e.g. "10.0.0.0/8")
+func LoadIPRules(lines string, prefixes *iradix.Tree, ips map[string]any, networks *critbitgo.Net) (*iradix.Tree, error) {
+	err := ProcessConfigLines(lines, func(line string, lineNo int) error {
+		if strings.Contains(line, "/") {
+			if networks == nil {
+				dlog.Errorf("CIDR rule [%s] at line %d but no network table provided", line, lineNo)
+				return nil
+			}
+			if err := networks.AddCIDR(line, true); err != nil {
+				dlog.Errorf("Invalid CIDR rule [%s] at line %d: %v", line, lineNo, err)
+			}
+			return nil
+		}
+		cleanLine, trailingStar, lineErr := ParseIPRule(line, lineNo)
+		if lineErr != nil {
+			dlog.Error(lineErr)
+			return nil // Continue processing (matching existing behavior)
+		}
+
+		if trailingStar {
+			prefixes, _, _ = prefixes.Insert([]byte(cleanLine), 0)
+		} else {
+			ips[cleanLine] = true
+		}
+		return nil
+	})
+	return prefixes, err
+}
+
+// InitializePluginLogger initializes a logger for a plugin if the log file is configured
+func InitializePluginLogger(logFile, format string, maxSize, maxAge, maxBackups int) (io.Writer, string) {
+	if len(logFile) > 0 {
+		return Logger(maxSize, maxAge, maxBackups, logFile), format
+	}
+	return nil, ""
+}
+
+// reverseAddr returns the in-addr.arpa. or ip6.arpa. hostname of the IP
+// address suitable for reverse DNS (PTR) record lookups.
+func reverseAddr(addr string) (string, error) {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return "", errors.New("unrecognized address: " + addr)
+	}
+	if v4 := ip.To4(); v4 != nil {
+		buf := make([]byte, 0, net.IPv4len*4+len("in-addr.arpa."))
+		for i := len(v4) - 1; i >= 0; i-- {
+			buf = strconv.AppendInt(buf, int64(v4[i]), 10)
+			buf = append(buf, '.')
+		}
+		buf = append(buf, "in-addr.arpa."...)
+		return string(buf), nil
+	}
+	// Must be IPv6
+	const hexDigits = "0123456789abcdef"
+	buf := make([]byte, 0, net.IPv6len*4+len("ip6.arpa."))
+	for i := len(ip) - 1; i >= 0; i-- {
+		v := ip[i]
+		buf = append(buf, hexDigits[v&0xF], '.', hexDigits[v>>4], '.')
+	}
+	buf = append(buf, "ip6.arpa."...)
+	return string(buf), nil
+}
+
+// fqdn returns the fully qualified domain name (with trailing dot)
+func fqdn(name string) string {
+	if len(name) == 0 || name[len(name)-1] == '.' {
+		return name
+	}
+	return name + "."
 }

@@ -3,11 +3,14 @@ package main
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
+	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/rdata"
 	"github.com/jedisct1/dlog"
-	"github.com/miekg/dns"
 )
 
 type CaptivePortalEntryIPs []net.IP
@@ -15,25 +18,22 @@ type CaptivePortalEntryIPs []net.IP
 type CaptivePortalMap map[string]CaptivePortalEntryIPs
 
 type CaptivePortalHandler struct {
+	wg            sync.WaitGroup
 	cancelChannel chan struct{}
-	countChannel  chan struct{}
-	channelCount  int
 }
 
 func (captivePortalHandler *CaptivePortalHandler) Stop() {
 	close(captivePortalHandler.cancelChannel)
-	for len(captivePortalHandler.countChannel) < captivePortalHandler.channelCount {
-		time.Sleep(time.Millisecond)
-	}
-	close(captivePortalHandler.countChannel)
+	captivePortalHandler.wg.Wait()
 }
 
-func (ipsMap *CaptivePortalMap) GetEntry(msg *dns.Msg) (*dns.Question, *CaptivePortalEntryIPs) {
+func (ipsMap *CaptivePortalMap) GetEntry(msg *dns.Msg) (dns.RR, *CaptivePortalEntryIPs) {
 	if len(msg.Question) != 1 {
 		return nil, nil
 	}
-	question := &msg.Question[0]
-	name, err := NormalizeQName(question.Name)
+	question := msg.Question[0]
+	hdr := question.Header()
+	name, err := NormalizeQName(hdr.Name)
 	if err != nil {
 		return nil, nil
 	}
@@ -41,47 +41,47 @@ func (ipsMap *CaptivePortalMap) GetEntry(msg *dns.Msg) (*dns.Question, *CaptiveP
 	if !ok {
 		return nil, nil
 	}
-	if question.Qclass != dns.ClassINET {
+	if hdr.Class != dns.ClassINET {
 		return nil, nil
 	}
 	return question, &ips
 }
 
-func HandleCaptivePortalQuery(msg *dns.Msg, question *dns.Question, ips *CaptivePortalEntryIPs) *dns.Msg {
+func HandleCaptivePortalQuery(msg *dns.Msg, question dns.RR, ips *CaptivePortalEntryIPs) *dns.Msg {
 	respMsg := EmptyResponseFromMessage(msg)
 	ttl := uint32(1)
-	if question.Qtype == dns.TypeA {
+	hdr := question.Header()
+	qtype := dns.RRToType(question)
+	if qtype == dns.TypeA {
 		for _, xip := range *ips {
 			if ip := xip.To4(); ip != nil {
 				rr := new(dns.A)
-				rr.Hdr = dns.RR_Header{Name: question.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl}
-				rr.A = ip
+				rr.Hdr = dns.Header{Name: hdr.Name, Class: dns.ClassINET, TTL: ttl}
+				rr.A = rdata.A{Addr: netip.AddrFrom4([4]byte(ip))}
 				respMsg.Answer = append(respMsg.Answer, rr)
 			}
 		}
-	} else if question.Qtype == dns.TypeAAAA {
+	} else if qtype == dns.TypeAAAA {
 		for _, xip := range *ips {
 			if xip.To4() == nil {
-				if ip := xip.To16(); ip != nil {
-					rr := new(dns.AAAA)
-					rr.Hdr = dns.RR_Header{Name: question.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl}
-					rr.AAAA = ip
-					respMsg.Answer = append(respMsg.Answer, rr)
-				}
+				rr := new(dns.AAAA)
+				rr.Hdr = dns.Header{Name: hdr.Name, Class: dns.ClassINET, TTL: ttl}
+				rr.AAAA = rdata.AAAA{Addr: netip.AddrFrom16([16]byte(xip.To16()))}
+				respMsg.Answer = append(respMsg.Answer, rr)
 			}
 		}
 	}
 
-	qType, ok := dns.TypeToString[question.Qtype]
+	qTypeStr, ok := dns.TypeToString[qtype]
 	if !ok {
-		qType = fmt.Sprint(question.Qtype)
+		qTypeStr = fmt.Sprint(qtype)
 	}
-	dlog.Infof("Query for captive portal detection: [%v] (%v)", question.Name, qType)
+	dlog.Infof("Query for captive portal detection: [%v] (%v)", hdr.Name, qTypeStr)
 	return respMsg
 }
 
 func handleColdStartClient(clientPc *net.UDPConn, cancelChannel chan struct{}, ipsMap *CaptivePortalMap) bool {
-	buffer := make([]byte, MaxDNSPacketSize-1)
+	buffer := make([]byte, MaxDNSPacketSize)
 	clientPc.SetDeadline(time.Now().Add(time.Duration(1) * time.Second))
 	length, clientAddr, err := clientPc.ReadFrom(buffer)
 	exit := false
@@ -102,7 +102,8 @@ func handleColdStartClient(clientPc *net.UDPConn, cancelChannel chan struct{}, i
 	}
 	packet := buffer[:length]
 	msg := &dns.Msg{}
-	if err := msg.Unpack(packet); err != nil {
+	msg.Data = packet
+	if err := msg.Unpack(); err != nil {
 		return false
 	}
 	question, ips := ipsMap.GetEntry(msg)
@@ -113,32 +114,38 @@ func handleColdStartClient(clientPc *net.UDPConn, cancelChannel chan struct{}, i
 	if respMsg == nil {
 		return false
 	}
-	if response, err := respMsg.Pack(); err == nil {
-		clientPc.WriteTo(response, clientAddr)
+	if err := respMsg.Pack(); err == nil {
+		clientPc.WriteTo(respMsg.Data, clientAddr)
 	}
 	return false
 }
 
 func addColdStartListener(
-	proxy *Proxy,
 	ipsMap *CaptivePortalMap,
 	listenAddrStr string,
 	captivePortalHandler *CaptivePortalHandler,
 ) error {
-	listenUDPAddr, err := net.ResolveUDPAddr("udp", listenAddrStr)
+	if len(listenAddrStr) == 0 {
+		return nil
+	}
+	network := "udp"
+	isIPv4 := isDigit(listenAddrStr[0])
+	if isIPv4 {
+		network = "udp4"
+	}
+	listenUDPAddr, err := net.ResolveUDPAddr(network, listenAddrStr)
 	if err != nil {
 		return err
 	}
-	clientPc, err := net.ListenUDP("udp", listenUDPAddr)
+	clientPc, err := net.ListenUDP(network, listenUDPAddr)
 	if err != nil {
 		return err
 	}
-	go func() {
+	captivePortalHandler.wg.Go(func() {
 		for !handleColdStartClient(clientPc, captivePortalHandler.cancelChannel, ipsMap) {
 		}
 		clientPc.Close()
-		captivePortalHandler.countChannel <- struct{}{}
-	}()
+	})
 	return nil
 }
 
@@ -146,13 +153,13 @@ func ColdStart(proxy *Proxy) (*CaptivePortalHandler, error) {
 	if len(proxy.captivePortalMapFile) == 0 {
 		return nil, nil
 	}
-	bin, err := ReadTextFile(proxy.captivePortalMapFile)
+	lines, err := ReadTextFile(proxy.captivePortalMapFile)
 	if err != nil {
 		dlog.Warn(err)
 		return nil, err
 	}
 	ipsMap := make(CaptivePortalMap)
-	for lineNo, line := range strings.Split(string(bin), "\n") {
+	for lineNo, line := range strings.Split(lines, "\n") {
 		line = TrimAndStripInlineComments(line)
 		if len(line) == 0 {
 			continue
@@ -168,8 +175,14 @@ func ColdStart(proxy *Proxy) (*CaptivePortalHandler, error) {
 		if err != nil {
 			continue
 		}
+		if strings.Contains(ipsStr, "*") {
+			return nil, fmt.Errorf(
+				"A captive portal rule must use an exact host name at line %d",
+				1+lineNo,
+			)
+		}
 		var ips []net.IP
-		for _, ip := range strings.Split(ipsStr, ",") {
+		for ip := range strings.SplitSeq(ipsStr, ",") {
 			ipStr := strings.TrimSpace(ip)
 			if ip := net.ParseIP(ipStr); ip != nil {
 				ips = append(ips, ip)
@@ -185,14 +198,17 @@ func ColdStart(proxy *Proxy) (*CaptivePortalHandler, error) {
 	listenAddrStrs := proxy.listenAddresses
 	captivePortalHandler := CaptivePortalHandler{
 		cancelChannel: make(chan struct{}),
-		countChannel:  make(chan struct{}, len(listenAddrStrs)),
-		channelCount:  0,
 	}
+	ok := false
 	for _, listenAddrStr := range listenAddrStrs {
-		if err := addColdStartListener(proxy, &ipsMap, listenAddrStr, &captivePortalHandler); err == nil {
-			captivePortalHandler.channelCount++
+		err = addColdStartListener(&ipsMap, listenAddrStr, &captivePortalHandler)
+		if err == nil {
+			ok = true
 		}
 	}
+	if ok {
+		err = nil
+	}
 	proxy.captivePortalMap = &ipsMap
-	return &captivePortalHandler, nil
+	return &captivePortalHandler, err
 }

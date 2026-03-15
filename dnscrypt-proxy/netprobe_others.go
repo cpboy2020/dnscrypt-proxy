@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package main
 
@@ -32,7 +31,7 @@ func NetProbe(proxy *Proxy, address string, timeout int) error {
 		timeout = Min(MaxTimeout, timeout)
 	}
 	for tries := timeout; tries > 0; tries-- {
-		pc, err := net.DialUDP("udp", nil, remoteUDPAddr)
+		pc, err := net.DialTimeout("udp", remoteUDPAddr.String(), proxy.timeout)
 		if err != nil {
 			if !retried {
 				retried = true

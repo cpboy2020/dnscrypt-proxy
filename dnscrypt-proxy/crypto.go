@@ -5,7 +5,6 @@ import (
 	crypto_rand "crypto/rand"
 	"crypto/sha512"
 	"errors"
-	"math/rand"
 
 	"github.com/jedisct1/dlog"
 	"github.com/jedisct1/xsecretbox"
@@ -60,7 +59,7 @@ func ComputeSharedKey(
 	} else {
 		box.Precompute(&sharedKey, serverPk, secretKey)
 		c := byte(0)
-		for i := 0; i < 32; i++ {
+		for i := range 32 {
 			c |= sharedKey[i]
 		}
 		if c == 0 {
@@ -70,7 +69,7 @@ func ComputeSharedKey(
 			}
 		}
 	}
-	return
+	return sharedKey
 }
 
 func (proxy *Proxy) Encrypt(
@@ -79,7 +78,9 @@ func (proxy *Proxy) Encrypt(
 	proto string,
 ) (sharedKey *[32]byte, encrypted []byte, clientNonce []byte, err error) {
 	nonce, clientNonce := make([]byte, NonceSize), make([]byte, HalfNonceSize)
-	crypto_rand.Read(clientNonce)
+	if _, err := crypto_rand.Read(clientNonce); err != nil {
+		return nil, nil, nil, err
+	}
 	copy(nonce, clientNonce)
 	var publicKey *[PublicKeySize]byte
 	if proxy.ephemeralKeys {
@@ -102,7 +103,9 @@ func (proxy *Proxy) Encrypt(
 		minQuestionSize = Max(proxy.questionSizeEstimator.MinQuestionSize(), minQuestionSize)
 	} else {
 		var xpad [1]byte
-		rand.Read(xpad[:])
+		if _, err := crypto_rand.Read(xpad[:]); err != nil {
+			return nil, nil, nil, err
+		}
 		minQuestionSize += int(xpad[0])
 	}
 	paddedLength := Min(MaxDNSUDPPacketSize, (Max(minQuestionSize, QueryOverhead)+1+63) & ^63)
@@ -113,7 +116,7 @@ func (proxy *Proxy) Encrypt(
 	}
 	if QueryOverhead+len(packet)+1 > paddedLength {
 		err = errors.New("Question too large; cannot be padded")
-		return
+		return sharedKey, encrypted, clientNonce, err
 	}
 	encrypted = append(serverInfo.MagicQuery[:], publicKey[:]...)
 	encrypted = append(encrypted, nonce[:HalfNonceSize]...)
@@ -125,7 +128,7 @@ func (proxy *Proxy) Encrypt(
 		copy(xsalsaNonce[:], nonce)
 		encrypted = secretbox.Seal(encrypted, padded, &xsalsaNonce, sharedKey)
 	}
-	return
+	return sharedKey, encrypted, clientNonce, err
 }
 
 func (proxy *Proxy) Decrypt(

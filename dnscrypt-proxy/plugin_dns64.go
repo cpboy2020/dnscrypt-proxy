@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
+	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/rdata"
 	"github.com/jedisct1/dlog"
-	"github.com/miekg/dns"
 )
 
 const rfc7050WKN = "ipv4only.arpa."
@@ -49,7 +52,7 @@ func (plugin *PluginDNS64) Init(proxy *Proxy) error {
 			if err != nil {
 				return err
 			}
-			dlog.Infof("Registered DNS64 prefix [%s]", pref.String())
+			dlog.Noticef("Registered DNS64 prefix [%s]", pref.String())
 			plugin.pref64 = append(plugin.pref64, pref)
 		}
 	} else if len(proxy.dns64Resolvers) != 0 {
@@ -57,7 +60,10 @@ func (plugin *PluginDNS64) Init(proxy *Proxy) error {
 		if err := plugin.refreshPref64(); err != nil {
 			return err
 		}
+	} else {
+		return nil
 	}
+	dlog.Notice("DNS64 map enabled")
 
 	return nil
 }
@@ -76,23 +82,25 @@ func (plugin *PluginDNS64) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 	}
 
 	question := pluginsState.questionMsg.Question[0]
-	if question.Qclass != dns.ClassINET || question.Qtype != dns.TypeAAAA {
+	qtype := dns.RRToType(question)
+	if question.Header().Class != dns.ClassINET || qtype != dns.TypeAAAA {
 		return nil
 	}
 
-	msgA := pluginsState.questionMsg.Copy()
-	msgA.SetQuestion(question.Name, dns.TypeA)
-	msgAPacket, err := msgA.Pack()
-	if err != nil {
+	msgA := dns.NewMsg(question.Header().Name, dns.TypeA)
+	msgA.ID = pluginsState.questionMsg.ID
+	msgA.RecursionDesired = pluginsState.questionMsg.RecursionDesired
+	if err := msgA.Pack(); err != nil {
 		return err
 	}
+	msgAPacket := msgA.Data
 
 	if !plugin.proxy.clientsCountInc() {
 		return errors.New("Too many concurrent connections to handle DNS64 subqueries")
 	}
 	respPacket := plugin.proxy.processIncomingQuery(
 		"trampoline",
-		plugin.proxy.mainProto,
+		plugin.proxy.xTransport.mainProto,
 		msgAPacket,
 		nil,
 		nil,
@@ -100,12 +108,17 @@ func (plugin *PluginDNS64) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 		false,
 	)
 	plugin.proxy.clientsCountDec()
-	resp := dns.Msg{}
-	if err := resp.Unpack(respPacket); err != nil {
+
+	if len(respPacket) == 0 {
+		return errors.New("Empty response from DNS64 trampoline query")
+	}
+
+	resp := dns.Msg{Data: respPacket}
+	if err := resp.Unpack(); err != nil {
 		return err
 	}
 
-	if err != nil || resp.Rcode != dns.RcodeSuccess {
+	if resp.Rcode != dns.RcodeSuccess {
 		return nil
 	}
 
@@ -116,35 +129,32 @@ func (plugin *PluginDNS64) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 	initialTTL := uint32(600)
 	for _, ns := range resp.Ns {
 		header := ns.Header()
-		if header.Rrtype == dns.TypeSOA {
-			initialTTL = header.Ttl
+		if dns.RRToType(ns) == dns.TypeSOA {
+			initialTTL = header.TTL
 		}
 	}
 
 	synth64 := make([]dns.RR, 0)
 	for _, answer := range resp.Answer {
 		header := answer.Header()
-		if header.Rrtype == dns.TypeCNAME {
+		rrtype := dns.RRToType(answer)
+		if rrtype == dns.TypeCNAME {
 			synth64 = append(synth64, answer)
-		} else if header.Rrtype == dns.TypeA {
-			ttl := initialTTL
-			if ttl > header.Ttl {
-				ttl = header.Ttl
-			}
+		} else if rrtype == dns.TypeA {
+			ttl := min(initialTTL, header.TTL)
 
-			ipv4 := answer.(*dns.A).A.To4()
-			if ipv4 != nil {
+			ipv4 := answer.(*dns.A).A.Addr.AsSlice()
+			if len(ipv4) == 4 {
 				plugin.pref64Mutex.RLock()
 				for _, prefix := range plugin.pref64 {
-					ipv6 := translateToIPv6(ipv4, prefix)
+					ipv6 := translateToIPv6(net.IP(ipv4), prefix)
 					synthAAAA := new(dns.AAAA)
-					synthAAAA.Hdr = dns.RR_Header{
-						Name:   header.Name,
-						Rrtype: dns.TypeAAAA,
-						Class:  header.Class,
-						Ttl:    ttl,
+					synthAAAA.Hdr = dns.Header{
+						Name:  header.Name,
+						Class: header.Class,
+						TTL:   ttl,
 					}
-					synthAAAA.AAAA = ipv6
+					synthAAAA.AAAA = rdata.AAAA{Addr: netip.AddrFrom16([16]byte(ipv6.To16()))}
 					synth64 = append(synth64, synthAAAA)
 				}
 				plugin.pref64Mutex.RUnlock()
@@ -152,11 +162,10 @@ func (plugin *PluginDNS64) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 		}
 	}
 
-	synth := EmptyResponseFromMessage(msg)
-	synth.Answer = append(synth.Answer, synth64...)
+	msg.Answer = synth64
+	msg.AuthenticatedData = false
+	msg.UDPSize = uint16(MaxDNSUDPSafePacketSize)
 
-	pluginsState.synthResponse = synth
-	pluginsState.action = PluginsActionSynth
 	pluginsState.returnCode = PluginsReturnCodeCloak
 
 	return nil
@@ -164,7 +173,7 @@ func (plugin *PluginDNS64) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 
 func hasAAAAAnswer(msg *dns.Msg) bool {
 	for _, answer := range msg.Answer {
-		if answer.Header().Rrtype == dns.TypeAAAA {
+		if dns.RRToType(answer) == dns.TypeAAAA {
 			return true
 		}
 	}
@@ -176,7 +185,7 @@ func translateToIPv6(ipv4 net.IP, prefix *net.IPNet) net.IP {
 	copy(ipv6, prefix.IP)
 	n, _ := prefix.Mask.Size()
 	ipShift := n / 8
-	for i := 0; i < net.IPv4len; i++ {
+	for i := range net.IPv4len {
 		if ipShift+i == 8 {
 			ipShift++
 		}
@@ -186,12 +195,12 @@ func translateToIPv6(ipv4 net.IP, prefix *net.IPNet) net.IP {
 }
 
 func (plugin *PluginDNS64) fetchPref64(resolver string) error {
-	msg := new(dns.Msg)
-	msg.SetQuestion(rfc7050WKN, dns.TypeAAAA)
+	msg := dns.NewMsg(rfc7050WKN, dns.TypeAAAA)
 
 	client := new(dns.Client)
-	resp, _, err := client.Exchange(msg, resolver)
-
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, _, err := client.Exchange(ctx, msg, "udp", resolver)
 	if err != nil {
 		return err
 	}
@@ -203,23 +212,23 @@ func (plugin *PluginDNS64) fetchPref64(resolver string) error {
 	uniqPrefixes := make(map[string]struct{})
 	prefixes := make([]*net.IPNet, 0)
 	for _, answer := range resp.Answer {
-		if answer.Header().Rrtype == dns.TypeAAAA {
-			ipv6 := answer.(*dns.AAAA).AAAA
+		if dns.RRToType(answer) == dns.TypeAAAA {
+			ipv6 := answer.(*dns.AAAA).AAAA.Addr.AsSlice()
 			if ipv6 != nil && len(ipv6) == net.IPv6len {
 				prefEnd := 0
 
 				if wka := net.IPv4(ipv6[12], ipv6[13], ipv6[14], ipv6[15]); wka.Equal(rfc7050WKA1) ||
-					wka.Equal(rfc7050WKA2) { //96
+					wka.Equal(rfc7050WKA2) { // 96
 					prefEnd = 12
-				} else if wka := net.IPv4(ipv6[9], ipv6[10], ipv6[11], ipv6[12]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { //64
+				} else if wka := net.IPv4(ipv6[9], ipv6[10], ipv6[11], ipv6[12]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { // 64
 					prefEnd = 8
-				} else if wka := net.IPv4(ipv6[7], ipv6[9], ipv6[10], ipv6[11]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { //56
+				} else if wka := net.IPv4(ipv6[7], ipv6[9], ipv6[10], ipv6[11]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { // 56
 					prefEnd = 7
-				} else if wka := net.IPv4(ipv6[6], ipv6[7], ipv6[9], ipv6[10]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { //48
+				} else if wka := net.IPv4(ipv6[6], ipv6[7], ipv6[9], ipv6[10]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { // 48
 					prefEnd = 6
-				} else if wka := net.IPv4(ipv6[5], ipv6[6], ipv6[7], ipv6[9]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { //40
+				} else if wka := net.IPv4(ipv6[5], ipv6[6], ipv6[7], ipv6[9]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { // 40
 					prefEnd = 5
-				} else if wka := net.IPv4(ipv6[4], ipv6[5], ipv6[6], ipv6[7]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { //32
+				} else if wka := net.IPv4(ipv6[4], ipv6[5], ipv6[6], ipv6[7]); wka.Equal(rfc7050WKA1) || wka.Equal(rfc7050WKA2) { // 32
 					prefEnd = 4
 				}
 
